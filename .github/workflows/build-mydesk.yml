@@ -1,0 +1,292 @@
+# ============================================================================
+# Build MyDesk Android APK (custom-branded RustDesk, arm64-v8a)
+#
+# 用法：
+#   1. fork https://github.com/rustdesk/rustdesk
+#   2. 在 fork 中新建 .github/workflows/build-mydesk.yml，内容与本文件一致
+#   3. Actions -> Build MyDesk Android APK -> Run workflow（默认即可）
+#   4. 构建完成后下载 artifact：mydesk-apk-arm64-v8a
+#
+# 说明：
+#   - 只构建 arm64-v8a（绝大多数现代手机）；需要 armeabi-v7a / x86_64 时
+#     自行把 matrix 扩回来（参考官方 flutter-build.yml build-rustdesk-android）。
+#   - 改名点全部收敛在下方 "rename to MyDesk" 一步：applicationId + label。
+#     想换成别的名字/包名，改 APP_NAME 与 APP_ID 两处即可。
+#   - 签名：默认用 debug key（每次构建签名一致，可正常覆盖安装）。
+#     若想用自己的 release keystore，在仓库 Settings -> Secrets and
+#     variables -> Actions 里配置 4 个 secret 后，会改用 r0adkll 签名：
+#       ANDROID_SIGNING_KEY      （keystore 文件的 base64）
+#       ANDROID_ALIAS
+#       ANDROID_KEY_STORE_PASSWORD
+#       ANDROID_KEY_PASSWORD
+#     本文件步骤与官方 flutter-build.yml / bridge.yml 对齐（master 分支，
+#     版本 VERSION 1.5.0、Flutter 3.24.5/3.22.3、NDK r28c、Rust 1.75）。
+# ============================================================================
+
+name: Build MyDesk Android APK
+
+on:
+  workflow_dispatch:
+
+env:
+  RUST_VERSION: "1.75"
+  ANDROID_FLUTTER_VERSION: "3.24.5"
+  BRIDGE_FLUTTER_VERSION: "3.22.3"
+  CARGO_NDK_VERSION: "3.1.2"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  NDK_VERSION: "r28c"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VERSION: "1.5.0"
+  # ---- MyDesk branding ----
+  APP_NAME: "MyDesk"
+  APP_ID: "com.mydesk.app"
+  ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Job 1: generate flutter-rust-bridge code (bridge-artifact)
+  # 复刻 rustdesk/rustdesk .github/workflows/bridge.yml 的 3.22.3 分支
+  # --------------------------------------------------------------------------
+  generate-bridge:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            clang cmake curl gcc git g++ libclang-dev libgtk-3-dev \
+            llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bridge-${{ runner.os }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.BRIDGE_FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install flutter rust bridge deps
+        shell: bash
+        run: |
+          cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+          cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+          # Flutter 3.22.3: extended_text 14 needs a newer Dart, downgrade to resolve.
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          pushd flutter && flutter pub get && popd
+
+      - name: Run flutter rust bridge
+        run: |
+          ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-artifact
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+
+  # --------------------------------------------------------------------------
+  # Job 2: rename to MyDesk + build arm64-v8a release APK
+  # 复刻 flutter-build.yml build-rustdesk-android 的 aarch64 分支
+  # --------------------------------------------------------------------------
+  build-android:
+    needs: [generate-bridge]
+    runs-on: ubuntu-24.04
+    env:
+      ANDROID_TARGET: "arm64-v8a"
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@v1
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ---------------- MyDesk 改名：只动 android 构建域 ----------------
+      # applicationId / namespace / manifest package：com.carriez.flutter_hbb -> APP_ID
+      # 桌面应用名（launcher label）+ 无障碍服务名：RustDesk -> APP_NAME
+      # 说明：包内 UI 文案仍含 RustDesk 属正常——MIUI 名单匹配的是
+      # applicationId + 签名，与界面字符串无关，刻意不全仓替换以免误伤逻辑。
+      - name: Rename to MyDesk
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_ID="${{ env.APP_ID }}"
+          APP_NAME="${{ env.APP_NAME }}"
+          MANIFEST=flutter/android/app/src/main/AndroidManifest.xml
+          GRADLE=flutter/android/app/build.gradle
+          # build.gradle：namespace + applicationId 都叫 com.carriez.flutter_hbb，整词安全替换
+          sed -i "s/com\.carriez\.flutter_hbb/${APP_ID}/g" "$GRADLE"
+          # AndroidManifest.xml：只改 package 属性与 label；
+          # 保留 .DEBUG_BOOT_COMPLETED 广播原名（与 Kotlin 端常量联动，不属于应用标识）
+          sed -i "s/package=\"com\.carriez\.flutter_hbb\"/package=\"${APP_ID}\"/g" "$MANIFEST"
+          sed -i "s/android:label=\"RustDesk\"/android:label=\"${APP_NAME}\"/g" "$MANIFEST"
+          sed -i "s/android:label=\"RustDesk Input\"/android:label=\"${APP_NAME} Input\"/g" "$MANIFEST"
+          echo "---- verify applicationId ----"
+          grep -n "applicationId\|namespace" "$GRADLE"
+          echo "---- verify manifest label/package ----"
+          grep -n "package=\|<application\|android:label" "$MANIFEST" | head -n 6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake curl gcc-multilib git g++ g++-multilib \
+            libayatana-appindicator3-dev libasound2-dev libc6-dev libclang-dev \
+            libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgtk-3-dev libpulse-dev libva-dev libxcb-randr0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxdo-dev libxfixes-dev llvm-dev nasm ninja-build \
+            openjdk-17-jdk-headless pkg-config tree wget
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          if [[ "${{ env.ANDROID_FLUTTER_VERSION }}" == "3.24.5" ]]; then
+            git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        run: |
+          if ! ./flutter/build_android_deps.sh "${{ env.ANDROID_TARGET }}"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rustdesk-lib-cache-android
+          key: aarch64-linux-android
+
+      - name: Build rustdesk lib
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
+          ./flutter/ndk_arm64.sh
+          mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
+          cp ./target/aarch64-linux-android/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+
+      - name: Build rustdesk apk
+        shell: bash
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        run: |
+          export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
+          # Increase Gradle JVM memory for CI builds
+          sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
+          # 无 key.properties：release build 先用 debug 签名（AGP 默认 key，跨构建稳定）
+          sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+          mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/
+          cp ./target/aarch64-linux-android/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+          pushd flutter
+          flutter build apk --release --target-platform android-arm64 --split-per-abi
+          popd
+          mkdir -p signed-apk
+          mv ./flutter/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk signed-apk/mydesk-${{ env.VERSION }}-arm64-v8a.apk
+
+      # 若配置了 release keystore secrets，则替换签名；否则直接上传 debug 签名包
+      - name: Setup sign tool version variable
+        if: env.ANDROID_SIGNING_KEY != ''
+        shell: bash
+        run: |
+          BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
+          echo "ANDROID_SIGN_TOOL_VERSION=$BUILD_TOOL_VERSION" >> $GITHUB_ENV
+
+      - uses: r0adkll/sign-android-release@v1
+        name: Sign app APK
+        if: env.ANDROID_SIGNING_KEY != ''
+        id: sign-rustdesk
+        with:
+          releaseDirectory: ./signed-apk
+          signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
+          alias: ${{ secrets.ANDROID_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
+
+      - name: Upload MyDesk APK (release-signed)
+        if: env.ANDROID_SIGNING_KEY != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: mydesk-apk-arm64-v8a-signed
+          path: ${{ steps.sign-rustdesk.outputs.signedReleaseFile }}
+
+      - name: Upload MyDesk APK (debug-signed)
+        if: env.ANDROID_SIGNING_KEY == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: mydesk-apk-arm64-v8a
+          path: signed-apk/mydesk-${{ env.VERSION }}-arm64-v8a.apk
