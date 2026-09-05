@@ -118,6 +118,7 @@ jobs:
       ANDROID_TARGET: "arm64-v8a"
     steps:
       - name: Free Disk Space (Ubuntu)
+        # 注意：此 action 没有 "v1" tag，官方 pin 的是 v1.3.1
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
         with:
           tool-cache: false
@@ -144,19 +145,38 @@ jobs:
           set -euo pipefail
           APP_ID="${{ env.APP_ID }}"
           APP_NAME="${{ env.APP_NAME }}"
-          MANIFEST=flutter/android/app/src/main/AndroidManifest.xml
-          GRADLE=flutter/android/app/build.gradle
-          # build.gradle：namespace + applicationId 都叫 com.carriez.flutter_hbb，整词安全替换
-          sed -i "s/com\.carriez\.flutter_hbb/${APP_ID}/g" "$GRADLE"
-          # AndroidManifest.xml：只改 package 属性与 label；
-          # 保留 .DEBUG_BOOT_COMPLETED 广播原名（与 Kotlin 端常量联动，不属于应用标识）
-          sed -i "s/package=\"com\.carriez\.flutter_hbb\"/package=\"${APP_ID}\"/g" "$MANIFEST"
-          sed -i "s/android:label=\"RustDesk\"/android:label=\"${APP_NAME}\"/g" "$MANIFEST"
-          sed -i "s/android:label=\"RustDesk Input\"/android:label=\"${APP_NAME} Input\"/g" "$MANIFEST"
-          echo "---- verify applicationId ----"
-          grep -n "applicationId\|namespace" "$GRADLE"
-          echo "---- verify manifest label/package ----"
-          grep -n "package=\|<application\|android:label" "$MANIFEST" | head -n 6
+          APP_ROOT=flutter/android/app
+          OLD_PKG=com.carriez.flutter_hbb
+          OLD_PATH=com/carriez/flutter_hbb
+          NEW_PATH=$(echo "$APP_ID" | tr '.' '/')
+          KOTLIN_BASE="$APP_ROOT/src/main/kotlin"
+          # 1) app 树全量文本替换旧包名（build.gradle 的 namespace/applicationId、
+          #    manifest 的 package、Kotlin 的 package/import/R 引用、
+          #    BootReceiver 调试广播常量、proguard keep 规则……全部同步为新包名，
+          #    保证 AGP 生成的 R 类(namespace 包)与 Kotlin 引用一致)
+          grep -rl --include='*.kt' --include='*.java' --include='*.xml' \
+               --include='*.pro' --include='*.txt' --include='*.gradle' \
+               "com\.carriez\.flutter_hbb" "$APP_ROOT" 2>/dev/null \
+            | xargs -r sed -i "s/com\.carriez\.flutter_hbb/${APP_ID}/g" || true
+          # 2) 应用显示名（桌面 launcher label + 无障碍服务 label）
+          sed -i "s/android:label=\"RustDesk\"/android:label=\"${APP_NAME}\"/g" "$APP_ROOT/src/main/AndroidManifest.xml"
+          sed -i "s/android:label=\"RustDesk Input\"/android:label=\"${APP_NAME} Input\"/g" "$APP_ROOT/src/main/AndroidManifest.xml"
+          # 3) Kotlin 目录随包名迁移：com/carriez/flutter_hbb -> <APP_ID 的路径形式>
+          #    注意：新包常以 com/ 开头（如 com/mydesk/app），因此只能清理残留的
+          #    旧层级 com/carriez，绝不能删整个 com/ 树，否则会误删刚迁入的新目录。
+          if [ -d "$KOTLIN_BASE/$OLD_PATH" ]; then
+            mkdir -p "$KOTLIN_BASE/$(dirname "$NEW_PATH")"
+            mv "$KOTLIN_BASE/$OLD_PATH" "$KOTLIN_BASE/$NEW_PATH"
+            rm -rf "$KOTLIN_BASE/com/carriez"
+          fi
+          echo "---- verify gradle ----"
+          grep -n "namespace\|applicationId" "$APP_ROOT/build.gradle"
+          echo "---- verify manifest ----"
+          grep -n "package=\|<application\|android:label" "$APP_ROOT/src/main/AndroidManifest.xml" | head -n 6
+          echo "---- verify kotlin dir ----"
+          find "$KOTLIN_BASE" -type f -name '*.kt' | head -n 20
+          echo "---- leftover old pkg in kt ----"
+          grep -rn "com\.carriez\.flutter_hbb" "$APP_ROOT" 2>/dev/null || echo "none"
 
       - name: Install dependencies
         run: |
